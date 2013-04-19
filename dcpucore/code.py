@@ -7,6 +7,9 @@ Metadata and tools for manipulating instructions.
 :copyright: (C) 2013 Matthew Frazier
 :license:   MIT/X11 -- see the LICENSE file for details
 """
+from .words import WORD_ARRAY, unsign_word
+import abc
+import array
 import itertools
 
 #: A constant that indicates a binary (two-argument) opcode.
@@ -14,6 +17,28 @@ BINARY = "binary"
 
 #: A constant that indicates a special (one-argument, lower 5 bits 0) opcode.
 SPECIAL = "special"
+
+
+#: A string with the names of the DCPU's 8 registers, in order.
+REGISTERS = "ABCXYZIJ"
+
+
+def show_displacement(n):
+    if n < 10:
+        return str(n)
+    elif n > 0xfff6:
+        return str(0x10000 - n)
+    else:
+        return hex(n)
+
+
+def show_maybe_address(n):
+    if n < 10:
+        return str(n)
+    elif n > 0xfff6:
+        return str(0x10000 - n)
+    else:
+        return "0x%04x" % n
 
 
 class Opcode(object):
@@ -80,7 +105,10 @@ class InstructionSet(object):
         Reserves space in the `opcodes` dictionary for each opcode.
         """
         self.opcodes[BINARY] = dict((n, None) for n in range(0x01, 0x20))
-        self.opcodes[SPECIAL] = dict((n, None) for n in range(0x01, 0x20))
+        # Special opcode 0x00 is "reserved for future expansion,"
+        # but it's useful to allow it to be overridden until Notch
+        # defines a new kind of opcode for it.
+        self.opcodes[SPECIAL] = dict((n, None) for n in range(0x00, 0x20))
 
     def register(self, opcode, replace=True):
         """
@@ -118,6 +146,344 @@ class InstructionSet(object):
 
         self.opcodes[opcode.type][opcode.number] = opcode
         self.by_mnemonic[opcode.mnemonic] = opcode
+
+    def decode_instruction(self, buffer, offset=0, wrap=True):
+        """
+        Decodes a complete instruction from the buffer. It will return
+        an `Instruction` object. (You can use the length of its
+        `~Instruction.source` attribute to advance the offset.)
+
+        :param buffer: A buffer of words to read the instruction from.
+        :param offset: The index to the start of the instruction within
+                       `buffer`.
+        :param wrap: If `True` (the default), reading past the buffer
+                     will result in it wrapping around. If `False`, no
+                     wrapping will be done, so you'll probably get an
+                     `IndexError`.
+        """
+        buflen = len(buffer)
+        source = array.array(WORD_ARRAY)
+
+        code_word = buffer[offset]
+        source.append(code_word)
+        offset = (offset + 1) % buflen if wrap else offset + 1
+
+        opcode_number = code_word & 0x1f
+        if opcode_number == 0:
+            # Special instruction
+            spec_opcode_number = (code_word >> 5) & 0x1f
+            opcode = self.opcodes[SPECIAL][spec_opcode_number]
+
+            a_code = code_word >> 10
+            if offset < buflen:
+                a, word_used = self._decode_address(a_code, buffer[offset])
+                if word_used:
+                    source.append(buffer[offset])
+                    offset = (offset + 1) % buflen if wrap else offset + 1
+            else:
+                a, word_used = self._decode_address(a_code, 0x0000)
+                if word_used:
+                    raise IndexError("address %02x required a read past "
+                                     "the end of the buffer" % a_code)
+
+            return SpecialInstruction(opcode, a, source)
+
+        else:
+            # Binary instruction
+            opcode = self.opcodes[BINARY][opcode_number]
+
+            a_code = (code_word >> 5) & 0x1f
+            if offset < buflen:
+                a, word_used = self._decode_address(a_code, buffer[offset])
+                if word_used:
+                    source.append(buffer[offset])
+                    offset = (offset + 1) % buflen if wrap else offset + 1
+            else:
+                a, word_used = self._decode_address(a_code, 0x0000)
+                if word_used:
+                    raise IndexError("address %02x required a read past "
+                                     "the end of the buffer" % a_code)
+
+            b_code = code_word >> 10
+            if offset < buflen:
+                b, word_used = self._decode_address(b_code, buffer[offset])
+                if word_used:
+                    source.append(buffer[offset])
+                    offset = (offset + 1) % buflen if wrap else offset + 1
+            else:
+                b, word_used = self._decode_address(b_code, 0x0000)
+                if word_used:
+                    raise IndexError("address %02x required a read past "
+                                     "the end of the buffer" % b_code)
+
+            return BinaryInstruction(opcode, a, b, source)
+
+    def _decode_address(self, lead, next_word):
+        if lead >= 0x20:
+            # Quick immediate value (-1 to 30)
+            return QuickImmediate(unsign_word((lead & 0x1f) - 1)), False
+        elif lead >= 0x18:
+            # Special value
+            if lead == 0x18:
+                return PUSHPOP, False
+            elif lead == 0x19:
+                return PEEK, False
+            elif lead == 0x1a:
+                return Pick(next_word), True
+            elif lead == 0x1b:
+                return SP, False
+            elif lead == 0x1c:
+                return PC, False
+            elif lead == 0x1d:
+                return EX, False
+            elif lead == 0x1e:
+                return Displacement(next_word), True
+            elif lead == 0x1f:
+                return Immediate(next_word), True
+        else:
+            # Register-linked value
+            control = lead & 0x18
+            if lead == 0x10:
+                # [Register + displacement]
+                return RegisterIndirectDisplaced(lead & 0x07, next_word), True
+            elif lead == 0x08:
+                # [Register]
+                return RegisterIndirect(lead & 0x07), False
+            else:
+                # Register
+                return Register(lead & 0x07), False
+
+
+class Instruction(object):
+    """
+    This is the base class for instructions.
+    """
+    __slots__ = ('source',)
+
+
+class BinaryInstruction(Instruction):
+    """
+    This class holds a binary instruction -- an opcode, and two arguments
+    `a` and `b`.
+    """
+    __slots__ = ('opcode', 'b', 'a')
+
+    def __init__(self, opcode, b, a, source=None):
+        #: The `Opcode` this instruction is for.
+        self.opcode = opcode
+        #: The `Address` pointing to this instruction's b argument.
+        self.b = b
+        #: The `Address` pointing to this instruction's a argument.
+        self.a = a
+        #: An `array.array` of words this instruction was decoded from.
+        self.source = source
+
+    def __str__(self):
+        return "%s %s, %s" % (self.opcode.mnemonic, self.b, self.a)
+
+
+class SpecialInstruction(Instruction):
+    """
+    This class holds a special instruction -- an opcode, and a single `a`
+    instruction.
+    """
+    __slots__ = ('opcode', 'a')
+
+    def __init__(self, opcode, a, source=None):
+        #: The `Opcode` this instruction is for.
+        self.opcode = opcode
+        #: The `Address` pointing to this instruction's a argument.
+        self.a = a
+        #: An `array.array` of words this instruction was decoded from.
+        self.source = source
+
+    def __str__(self):
+        return "%s %s" % (self.opcode.mnemonic, self.a)
+
+
+class Address(object):
+    """
+    This class represents addresses. Each subclass corresponds to an
+    addressing mode.
+    """
+    __metaclass__ = abc.ABCMeta
+    __slots__ = ()
+
+    def __str__(self):
+        return self.display_load()
+
+    @abc.abstractmethod
+    def display_load(self):
+        """
+        The string representation of this address in a load context.
+        """
+
+    def display_store(self):
+        """
+        The string representation of this address in a store context.
+        (Usually this will be the same as `display_load`.)
+        """
+        return self.display_load()
+
+    #: The extra cost in clock cycles incurred by decoding this address.
+    decode_cost = 0
+
+
+class Register(Address):
+    """
+    An `Address` to the contents of a register (ABCXYZIJ).
+
+    :param register: The index number of the register to access.
+    """
+    __slots__ = ('register',)
+
+    def __init__(self, register):
+        self.register = register
+
+    def display_load(self):
+        return REGISTERS[self.register]
+
+
+class RegisterIndirect(Address):
+    """
+    An `Address` for the memory address stored in a register (ABCXYZIJ).
+
+    :param register: The index number of the register to access.
+    """
+    __slots__ = ('register',)
+
+    def __init__(self, register):
+        self.register = register
+
+    def display_load(self):
+        return "[" + REGISTERS[self.register] + "]"
+
+
+class RegisterIndirectDisplaced(Address):
+    """
+    An `Address` for the memory address at a constant offset from an
+    address stored in a register (ABCXYZIJ).
+
+    :param register: The index number of the register to access.
+    :param displacement: The offset to access from the original value
+    """
+    __slots__ = ('register', 'displacement',)
+
+    def __init__(self, register, displacement):
+        self.register = register
+        self.displacement = displacement
+
+    def display_load(self):
+        return "[%s + %s]" % (REGISTERS[self.register],
+                              show_displacement(self.displacement))
+
+    decode_cost = 1
+
+
+class PushPopAddress(Address):
+    __slots__ = ()
+
+    def display_load(self):
+        return "POP"
+
+    def display_store(self):
+        return "PUSH"
+
+
+#: An `Address` that pushes values on the stack in store context,
+#: and pops them in load context.
+PUSHPOP = PushPopAddress()
+
+
+class PeekAddress(Address):
+    __slots__ = ()
+
+    def display_load(self):
+        return "[SP]"
+
+
+#: An `Address` that refers to the stack top.
+PEEK = PeekAddress()
+
+
+class Pick(Address):
+    """
+    An `Address` mode that accesses a word at a position relative to the
+    stack pointer (SP).
+
+    :param displacement: The distance from SP.
+    """
+    __slots__ = ('displacement',)
+
+    def __init__(self, displacement):
+        self.displacement = displacement
+
+    def display_load(self):
+        return "[SP + %s]" % show_displacement(self.displacement)
+
+    decode_cost = 1
+
+
+class SpecialRegister(Address):
+    __slots__ = ('name')
+
+    def __init__(self, name):
+        self.name = name
+
+    def display_load(self):
+        return self.name
+
+
+#: The `Address` representing the SP (stack pointer) register.
+SP = SpecialRegister("SP")
+
+#: The `Address` representing the PC (program counter) register.
+PC = SpecialRegister("PC")
+
+#: The `Address` representing the EX (excess/overflow) register.
+EX = SpecialRegister("EX")
+
+
+class Displacement(Address):
+    """
+    An `Address` that refers to a specific location in memory.
+
+    :param address: The address to access.
+    """
+    __slots__ = ('address',)
+
+    def __init__(self, address):
+        self.address = address
+
+    def display_load(self):
+        return "[0x%04x]" % self.address
+
+    decode_cost = 1
+
+
+class Immediate(Address):
+    """
+    An `Address` that simply holds a constant value.
+
+    :param value: The value of the constant to access.
+    """
+    __slots__ = ('value',)
+
+    def __init__(self, value):
+        self.value = value
+
+    def display_load(self):
+        return show_maybe_address(self.value)
+
+    decode_cost = 1
+
+
+class QuickImmediate(Immediate):
+    """
+    Like `Immediate`, but faster.
+    """
+    __slots__ = ()
+    decode_cost = 0
 
 
 #: A list of `Opcode` instances for the DCPU-16 1.7 standard.
