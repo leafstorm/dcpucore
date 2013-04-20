@@ -9,6 +9,12 @@ The actual DCPU emulator.
 """
 import array
 
+class DCPURuntimeException(Exception):
+    """
+    This represents something unexpected happening during emulation.
+    """
+
+
 class Emulator(object):
     """
     This represents a DCPU-16.

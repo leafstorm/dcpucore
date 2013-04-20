@@ -65,4 +65,4 @@ def unsign_word(sword):
 
     :param sword: The signed word to convert.
     """
-    return 0x10000 + word if word < 0 else word
+    return 0x10000 + sword if sword < 0 else sword
