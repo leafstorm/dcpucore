@@ -33,6 +33,8 @@ del candidate, test
 
 
 #: This mask can be used to strip off anything that's not a word.
+#: Conveniently, it will also flip a negative number to its
+#: twos-complement representation.
 WORD_MASK = 0xFFFF
 
 #: The minimum possible value of a DCPU-16 word.
@@ -40,6 +42,12 @@ WORD_MIN = 0
 
 #: The maximum possible value of a DCPU-16 word.
 WORD_MAX = 0xFFFF
+
+
+#: This mask can be used to strip off anything that's not a double word.
+#: Conveniently, it will also flip a negative number to its
+#: twos-complement representation.
+DWORD_MASK = 0xFFFFFFFF
 
 
 def sign_word(word):
@@ -56,13 +64,15 @@ def sign_word(word):
     return -(0x10000 - word) if word > 0x7FFF else word
 
 
-def unsign_word(sword):
+def sign_dword(dword):
     """
-    Takes a signed word and converts it back to an unsigned word.
+    Takes an unsigned double word and converts it into a signed word.
+    (Words between 0 and 0x7FFFFFFF will be returned as is,
+    0x80000000 to 0xFFFFFFFF will be converted to their negative version.)
 
     This function will NOT behave properly on words outside the range
-    -0x8000 to 0x7FFF.
+    0x00000000 to 0xFFFFFFFF.
 
-    :param sword: The signed word to convert.
+    :param dword: The unsigned double word to convert.
     """
-    return 0x10000 + sword if sword < 0 else sword
+    return -(0x100000000 - dword) if dword > 0x7FFFFFFF else dword

@@ -19,7 +19,7 @@ from .code import (DCPU_17, resolve_symbol,
                    Register, RegisterIndirect, RegisterIndirectDisplaced,
                    Displacement, Immediate, QuickImmediate,
                    PUSHPOP, PEEK, Pick, SP, PC, EX)
-from .words import WORD_ARRAY, WORD_MASK, unsign_word
+from .words import WORD_ARRAY, WORD_MASK
 
 class AssemblyLexer(object):
     def __init__(self, instruction_set=DCPU_17):
@@ -76,17 +76,17 @@ class AssemblyLexer(object):
 
     def t_HEX(self, t):
         r'\-?0x[a-fA-F0-9]+'
-        t.value = unsign_word(int(t.value, 16)) & WORD_MASK
+        t.value = int(t.value, 16) & WORD_MASK
         return t
 
     def t_OCT(self, t):
         r'\-?0\d+'
-        t.value = unsign_word(int(t.value, 8)) & WORD_MASK
+        t.value = int(t.value, 8) & WORD_MASK
         return t
 
     def t_DECIMAL(self, t):
         r'\-?\d+'
-        t.value = unsign_word(int(t.value)) & WORD_MASK
+        t.value = int(t.value, 10) & WORD_MASK
         return t
 
     def t_LABEL(self, t):
