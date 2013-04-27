@@ -7,7 +7,7 @@ Metadata and tools for manipulating instructions.
 :copyright: (C) 2013 Matthew Frazier
 :license:   MIT/X11 -- see the LICENSE file for details
 """
-from .words import WORD_ARRAY, unsign_word
+from .words import WORD_ARRAY
 import abc
 import array
 import itertools
@@ -301,8 +301,9 @@ class Instruction(object):
     @abc.abstractproperty
     def size(self):
         """
-        Returns the encoded size of this instruction.
-        (This should be the same independent of any symbols provided.)
+        The encoded size of this instruction.
+        (This should be the same independent of any symbols provided
+        during assembly.)
         """
         pass
 

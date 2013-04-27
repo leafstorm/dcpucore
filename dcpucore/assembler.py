@@ -12,6 +12,7 @@ which is released under a MIT license.
 :license:   MIT/X11 -- see the LICENSE file for details
 """
 import array
+import inspect
 import ply.lex as lex
 import ply.yacc as yacc
 from .code import (DCPU_17, resolve_symbol,
@@ -22,14 +23,35 @@ from .code import (DCPU_17, resolve_symbol,
 from .words import WORD_ARRAY, WORD_MASK
 
 class AssemblyLexer(object):
-    def __init__(self, instruction_set=DCPU_17):
+    """
+    A lexer for DCPU-16 assembly language. Few details of the language are
+    hard-coded -- the interpretation of many tokens is based on the
+    instruction set in use.
+
+    :param instruction_set: The instruction set this lexer should use.
+    :param single: If `False` (the default), the start rule will be
+                   "one or more instructions." If `True`, the start rule
+                   will be "one instruction."
+    :param suppress_keywords: A quick way to disable assembler features
+                              you don't want. This is a list of keywords
+                              to not lex as keywords, which will result
+                              in the corresponding directives not being
+                              parsed. (For example, to disable ``.ORG``,
+                              you could pass ``suppress_keywords=['.ORG']``.)
+    :param lex_debug: If `True`, PLY will generate rather annoying debugging
+                      output.
+    """
+    def __init__(self, instruction_set=DCPU_17, keywords=(), lex_debug=False):
         self.isa = instruction_set
+        self.keywords = keywords
+
         self.tokens = list(self.base_tokens)
-        self.tokens.extend(self.keywords)
+        self.tokens.extend('DOT_' + kw[1:] if kw[0] == '.' else kw
+                           for kw in self.keywords)
         self.tokens.extend(self.isa.SPECIAL_REGISTERS)
         self.tokens.extend(self.isa.SPECIAL_OPERATIONS)
         self.tokens.extend(t.upper() + '_OP' for t in self.isa.opcodes)
-        self.lexer = lex.lex(module=self)
+        self.lexer = lex.lex(module=self, debug=lex_debug)
 
     base_tokens = (
         'LBRACK',
@@ -44,11 +66,8 @@ class AssemblyLexer(object):
         'CHAR',
         'INC',
         'DEC',
-        'AT',
         'GP_REG'
     )
-
-    keywords = frozenset(('DAT',))
 
     t_ignore = ' \t\r,'
     t_ignore_COMMENT = r';.*'
@@ -58,7 +77,6 @@ class AssemblyLexer(object):
     t_LBRACK = r'\['
     t_RBRACK = r'\]'
     t_PLUS = r'\+'
-    t_AT = r'\@'
 
     def t_newline(self, t):
         r'\n+'
@@ -109,7 +127,7 @@ class AssemblyLexer(object):
             t.value = upper
         elif (upper in self.keywords or upper in self.isa.SPECIAL_REGISTERS or
               upper in self.isa.SPECIAL_OPERATIONS):
-            t.type = upper
+            t.type = 'DOT_' + upper[1:] if upper[0] == '.' else upper
             t.value = upper
         else:
             t.type = 'ID'
@@ -121,18 +139,29 @@ class AssemblyLexer(object):
 
 
 class Program(object):
-    def __init__(self, instructions):
-        self.instructions = instructions
+    def __init__(self, instructions=()):
+        self.instructions = []
         self.source = None
-        self.size = 0
+        self.offset = 0
         self.symbols = {}
 
+        if instructions:
+            self.add(instructions)
+
+    def add(self, instructions):
         for inst in instructions:
-            if inst.offset is None:
-                inst.offset = self.size
-                self.size += inst.size
+            if isinstance(inst, Origin):
+                self.offset = inst.offset
+            elif inst.offset is None:
+                inst.offset = self.offset
+                self.offset += inst.size
+
             if isinstance(inst, Label):
                 self.symbols[inst.name] = inst.offset
+            elif isinstance(inst, Equate):
+                self.symbols[inst.name] = inst.value
+
+            self.instructions.append(inst)
 
     def assemble(self):
         result = array.array(WORD_ARRAY)
@@ -145,10 +174,36 @@ class Label(object):
     def __init__(self, name, offset=None):
         self.name = name
         self.size = 0
-        self.offset = self.size
+        self.offset = offset
 
     def __str__(self):
         return ":%s" % self.name
+
+    def assemble(self, symbols=None):
+        return []
+
+
+class Equate(object):
+    def __init__(self, name, value=None):
+        self.name = name
+        self.size = 0
+        self.offset = None
+        self.value = value
+
+    def __str__(self):
+        return ":%s equ %s" % self.value
+
+    def assemble(self, symbols=None):
+        return []
+
+
+class Origin(object):
+    def __init__(self, offset):
+        self.size = 0
+        self.offset = offset
+
+    def __str__(self):
+        return ".ORG 0x%04x" % self.offset
 
     def assemble(self, symbols=None):
         return []
@@ -160,29 +215,85 @@ class Data(object):
         self.offset = None
         self.size = len(self.data)
 
+    def __str__(self):
+        return "DAT " + ", ".join(str(x) for x in self.data)
+
     def assemble(self, symbols=None):
         data = array.array(WORD_ARRAY)
         data.extend(resolve_symbol(sym, symbols) for sym in self.data)
         return data
 
 
+def keyword(*words):
+    """
+    A decorator that associates specific keywords with a parse rule
+    on an instance of `AssemblyParser`. This will result in these
+    words automatically being treated as keywords by the lexer.
+
+    (Behavior is undefined if a keyword on the parser conflicts with a
+    reserved word loaded from the instruction set.)
+    """
+    def decorate(fn):
+        fn.asm_keywords = words
+        return fn
+
+    return decorate
+
+
 class AssemblyParser(object):
-    def __init__(self, instruction_set=DCPU_17):
+    """
+    A parser for DCPU-16 assembly language. You can customize the language
+    either by using the instruction set, or by subclassing and
+    adding/overriding PLY parse methods.
+
+    :param instruction_set: The instruction set this parser should use.
+    :param single: If `False` (the default), the start rule will be
+                   "one or more instructions." If `True`, the start rule
+                   will be "one instruction."
+    :param suppress_keywords: A quick way to disable assembler features
+                              you don't want. This is a list of keywords
+                              to not lex as keywords, which will result
+                              in the corresponding directives not being
+                              parsed. (For example, to disable ``.ORG``,
+                              you could pass ``suppress_keywords=['.ORG']``.)
+    :param yacc_debug: If `True`, PLY will generate rather annoying debugging
+                       output.
+    """
+    def __init__(self, instruction_set=DCPU_17, single=False,
+                 suppress_keywords=(), yacc_debug=False):
         self.isa = instruction_set
-        self.lexer = AssemblyLexer(instruction_set)
+
+        self.keywords = set()
+        for name, item in inspect.getmembers(self):
+            if inspect.ismethod(item) and getattr(item, 'asm_keywords', ()):
+                self.keywords.update(item.asm_keywords)
+        for keyword in suppress_keywords:
+            self.keywords.discard(keyword)
+
+        self.lexer = self.create_lexer(yacc_debug)
         self.tokens = self.lexer.tokens
-        self.parser = yacc.yacc(module=self, debug=False, write_tables=False)
+        self.start = 'instruction' if single is True else 'instructions'
+
+        self.parser = yacc.yacc(module=self, debug=yacc_debug,
+                                write_tables=False)
+
+    def create_lexer(self, lex_debug=False):
+        """
+        Creates a PLY lexer instance for this parser.
+
+        :param lex_debug: If `True`, PLY will generate rather annoying
+                          debugging output.
+        """
+        return AssemblyLexer(self.isa, self.keywords, lex_debug=lex_debug)
 
     def parse(self, source, filename=None):
-        program = self.parser.parse(source, lexer=self.lexer.lexer)
-        program.source = source
-        return program
+        """
+        Parses assembly code into instruction objects.
 
-    start = 'program'
-
-    def p_program(self, t):
-        'program : instructions'
-        t[0] = Program(t[1])
+        :param source: The assembly source to parse.
+        :param filename: The name of the file it was read from.
+        """
+        return self.parser.parse(source, lexer=self.lexer.lexer)
 
     def p_instructions(self, t):
         'instructions : instruction instructions'
@@ -206,10 +317,20 @@ class AssemblyParser(object):
         else:
             t[0] = arg
 
+    @keyword('DAT')
     def p_instruction_data(self, t):
         'instruction : DAT data'
         t[0] = Data(t[2])
 
+    @keyword('.ORG')
+    def p_instruction_org(self, t):
+        'instruction : DOT_ORG number_literal'
+        t[0] = Origin(t[2])
+
+    @keyword('EQU')
+    def p_instruction_equ(self, t):
+        'instruction : LABEL EQU number_literal'
+        t[0] = Equate(t[1], t[3])
 
     def p_instruction_label(self, t):
         'instruction : LABEL'
@@ -301,6 +422,13 @@ class AssemblyParser(object):
                   | OCT
                   | ID
                   | CHAR'''
+        t[0] = t[1]
+
+    def p_number_literal(self, t):
+        '''number_literal : DECIMAL
+                          | HEX
+                          | OCT
+                          | CHAR'''
         t[0] = t[1]
 
 
