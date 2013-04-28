@@ -22,6 +22,184 @@ from .code import (DCPU_17, resolve_symbol,
                    PUSHPOP, PEEK, Pick, SP, PC, EX)
 from .words import WORD_ARRAY, WORD_MASK
 
+class Program(object):
+    """
+    A program represents an instruction stream in the process of being
+    assembled. It operates in two passes:
+
+    * In the first pass, any symbols that have already been assigned values
+      are resolved. The instruction is optimized if possible, and appended
+      to the instruction stream.
+    * In the second pass, any remaining symbols are resolved. No optimization
+      takes place during this pass, to prevent the offsets from changing.
+
+    :param instructions: Any initial instructions to append to the instruction
+                         stream.
+    """
+    def __init__(self, instructions=()):
+        self.instructions = []
+        self.source = None
+        self.offset = 0
+        self.symbols = {}
+
+        if instructions:
+            self.add(instructions)
+
+    def add(self, instructions):
+        """
+        Adds instructions to the instruction stream, and runs the first pass
+        of assembly on them. Calling `add` multiple times will place each
+        instruction sequence one after another.
+
+        :param instructions: The instructions to add and assemble.
+        """
+        for inst in instructions:
+            if isinstance(inst, Origin):
+                self.offset = inst.offset
+            elif isinstance(inst, Label):
+                inst.offset = self.offset
+                self.symbols[inst.name] = inst.offset
+            elif isinstance(inst, Equate):
+                inst.offset = self.offset
+                inst.resolve(self.symbols, True)
+                self.symbols[inst.name] = inst.value
+            else:
+                inst.resolve(self.symbols, False)
+                if hasattr(inst, 'optimize'):
+                    inst = inst.optimize()
+
+                inst.offset = self.offset
+
+            self.offset += inst.size
+            self.instructions.append(inst)
+
+    def assemble(self):
+        """
+        Runs the second assembly pass on the instructions in this program,
+        and returns a word array with the assembled code.
+        """
+        result = array.array(WORD_ARRAY)
+        for inst in self.instructions:
+            inst.resolve(self.symbols, True)
+            result.extend(inst.assemble())
+        return result
+
+
+class Label(object):
+    """
+    Marks a point in an instruction stream that other instructions can
+    refer to.
+
+    :param name: The symbol's name.
+    :param offset: A specific offset to used, if it can't be determined
+                   automatically.
+    """
+    def __init__(self, name, offset=None):
+        self.name = name
+        self.size = 0
+        self.is_resolved = True
+        self.offset = offset
+
+    def __str__(self):
+        return ":%s" % self.name
+
+    def copy(self):
+        return self
+
+    def resolve(self, symbols, require=False):
+        pass
+
+    def assemble(self):
+        return []
+
+
+class Equate(object):
+    """
+    Defines a symbol with a specific value (used similarly to a label).
+
+    :param name: The symbol's name.
+    :param value: The symbol's value.
+    """
+    def __init__(self, name, value):
+        self.name = name
+        self.size = 0
+        self.offset = None
+        self.value = value
+
+    def __str__(self):
+        return ":%s equ %s" % self.value
+
+    def copy(self):
+        return Equate(self.name, self.value)
+
+    @property
+    def is_resolved(self):
+        return not isinstance(self.value, basestring)
+
+    def resolve(self, symbols, require=False):
+        self.value = resolve_symbol(self.value, symbols, require)
+
+    def assemble(self):
+        return []
+
+
+class Origin(object):
+    """
+    Resets the current offset to a given value. (This does not actually move
+    the code -- the DCPU must take care of moving any code necessary.)
+
+    :param offset: The new offset to generate code for.
+    """
+    def __init__(self, offset):
+        self.size = 0
+        self.is_resolved = True
+        self.offset = offset
+
+    def __str__(self):
+        return ".ORG 0x%04x" % self.offset
+
+    def copy(self):
+        return self
+
+    def resolve(self, symbols, require=False):
+        pass
+
+    def assemble(self):
+        return []
+
+
+class Data(object):
+    """
+    Represents a block of data in an instruction stream.
+
+    :param data: A tuple of words (either actual integers or symbols).
+    """
+    def __init__(self, data):
+        self.data = data
+        self.offset = None
+        self.size = len(self.data)
+
+    def __str__(self):
+        return "DAT " + ", ".join(str(x) for x in self.data)
+
+    def copy(self):
+        return Data(self.data)
+
+    @property
+    def is_resolved(self):
+        return not any(isinstance(d, basestring) for d in self.data)
+
+    def resolve(self, symbols, require=False):
+        self.data = tuple(
+            resolve_symbol(d, symbols, require) for d in self.data
+        )
+
+    def assemble(self):
+        data = array.array(WORD_ARRAY)
+        data.extend(self.data)
+        return data
+
+
 class AssemblyLexer(object):
     """
     A lexer for DCPU-16 assembly language. Few details of the language are
@@ -138,92 +316,6 @@ class AssemblyLexer(object):
                         (t.lineno, t.value))
 
 
-class Program(object):
-    def __init__(self, instructions=()):
-        self.instructions = []
-        self.source = None
-        self.offset = 0
-        self.symbols = {}
-
-        if instructions:
-            self.add(instructions)
-
-    def add(self, instructions):
-        for inst in instructions:
-            if isinstance(inst, Origin):
-                self.offset = inst.offset
-            elif inst.offset is None:
-                inst.offset = self.offset
-                self.offset += inst.size
-
-            if isinstance(inst, Label):
-                self.symbols[inst.name] = inst.offset
-            elif isinstance(inst, Equate):
-                self.symbols[inst.name] = inst.value
-
-            self.instructions.append(inst)
-
-    def assemble(self):
-        result = array.array(WORD_ARRAY)
-        for inst in self.instructions:
-            result.extend(inst.assemble(self.symbols))
-        return result
-
-
-class Label(object):
-    def __init__(self, name, offset=None):
-        self.name = name
-        self.size = 0
-        self.offset = offset
-
-    def __str__(self):
-        return ":%s" % self.name
-
-    def assemble(self, symbols=None):
-        return []
-
-
-class Equate(object):
-    def __init__(self, name, value=None):
-        self.name = name
-        self.size = 0
-        self.offset = None
-        self.value = value
-
-    def __str__(self):
-        return ":%s equ %s" % self.value
-
-    def assemble(self, symbols=None):
-        return []
-
-
-class Origin(object):
-    def __init__(self, offset):
-        self.size = 0
-        self.offset = offset
-
-    def __str__(self):
-        return ".ORG 0x%04x" % self.offset
-
-    def assemble(self, symbols=None):
-        return []
-
-
-class Data(object):
-    def __init__(self, data):
-        self.data = data
-        self.offset = None
-        self.size = len(self.data)
-
-    def __str__(self):
-        return "DAT " + ", ".join(str(x) for x in self.data)
-
-    def assemble(self, symbols=None):
-        data = array.array(WORD_ARRAY)
-        data.extend(resolve_symbol(sym, symbols) for sym in self.data)
-        return data
-
-
 def keyword(*words):
     """
     A decorator that associates specific keywords with a parse rule
@@ -329,7 +421,7 @@ class AssemblyParser(object):
 
     @keyword('EQU')
     def p_instruction_equ(self, t):
-        'instruction : LABEL EQU number_literal'
+        'instruction : LABEL EQU number'
         t[0] = Equate(t[1], t[3])
 
     def p_instruction_label(self, t):
@@ -380,7 +472,10 @@ class AssemblyParser(object):
         t[0] = PUSHPOP
 
     def p_address_peek(self, t):
-        'address : LBRACK SP RBRACK'
+        """
+        address : LBRACK SP RBRACK
+        address : PEEK
+        """
         t[0] = PEEK
 
     def p_address_pick_l(self, t):

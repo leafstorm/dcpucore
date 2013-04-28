@@ -7,7 +7,7 @@ Metadata and tools for manipulating instructions.
 :copyright: (C) 2013 Matthew Frazier
 :license:   MIT/X11 -- see the LICENSE file for details
 """
-from .words import WORD_ARRAY
+from .words import WORD_ARRAY, WORD_MASK
 import abc
 import array
 import itertools
@@ -29,7 +29,7 @@ def show_displacement(n):
     elif n < 10:
         return str(n)
     elif n > 0xfff6:
-        return str(0x10000 - n)
+        return str(-(0x10000 - n))
     else:
         return hex(n)
 
@@ -99,7 +99,7 @@ class InstructionSet(object):
     SPECIAL_REGISTERS = frozenset(("EX", "PC", "SP"))
 
     #: A `frozenset` of special address operations.
-    SPECIAL_OPERATIONS = frozenset(("PUSH", "POP", "PICK"))
+    SPECIAL_OPERATIONS = frozenset(("PUSH", "POP", "PICK", "PEEK"))
 
     def __init__(self, opcodes=None):
         #: A `dict` whose keys are opcode types and whose values are `dict`\s
@@ -282,6 +282,27 @@ class InstructionSet(object):
                 return Register(lead & 0x07), False
 
 
+def resolve_symbol(sym, symbols, require=False):
+    """
+    Looks up a symbol in the provided dictionary.
+
+    :param sym: A symbol name. This will be returned as-is if it is not a
+    string.
+    :param symbols: A dictionary mapping symbol names to values.
+    :param require: If `True`, a `NameError` will be thrown when a
+                    symbol cannot be resolved. If `False`, the symbol
+                    will simply be left unresolved.
+    """
+    if isinstance(sym, basestring):
+        if symbols is None or sym not in symbols:
+            if require:
+                raise NameError("Undefined symbol '%s'" % sym)
+            else:
+                return sym
+        return symbols[sym]
+    return sym
+
+
 class Instruction(object):
     """
     This is the base class for instructions.
@@ -290,22 +311,59 @@ class Instruction(object):
     __slots__ = ('offset', 'source',)
 
     @abc.abstractmethod
-    def assemble(self, symbols=None):
+    def copy(self):
+        """
+        Creates a copy of this instruction. If this instruction is resolved,
+        the copy should be resolved as well.
+        """
+
+    @abc.abstractproperty
+    def is_resolved(self):
+        """
+        Indicates whether this instruction contains any unresolved symbol
+        references (and therefore cannot be assembled).
+        """
+
+    @abc.abstractmethod
+    def resolve(self, symbols, require=False):
+        """
+        Resolves any symbol references in this instruction, using the
+        contents of `symbols`. (`resolve_symbol` is useful for this.)
+
+        :param symbols: A dictionary of symbols.
+        :param require: If `True`, a `NameError` should be thrown when a
+                        symbol cannot be resolved. If `False`, the symbol
+                        should simply be left unresolved.
+        """
+
+    @abc.abstractmethod
+    def optimize(self):
+        """
+        Returns a more efficient copy of this instruction, if one exists.
+        (If one does not exist, it should return itself.)
+        """
+
+    @abc.abstractproperty
+    def base_cost(self):
+        """
+        The base cost of executing this instruction, in cycles.
+        This should include the base cost of the opcode, plus the decode
+        costs associated with the operands.
+        """
+
+    @abc.abstractmethod
+    def assemble(self):
         """
         This will assemble this instruction into machine code.
-
-        :param symbols: A dictionary of symbols to look for label values in.
-                        (This won't be a problem unless there are labels.)
         """
 
     @abc.abstractproperty
     def size(self):
         """
         The encoded size of this instruction.
-        (This should be the same independent of any symbols provided
-        during assembly.)
+        (This should be the same even if a symbol contained within this
+        instruction is resolved later.)
         """
-        pass
 
 
 class BinaryInstruction(Instruction):
@@ -330,10 +388,32 @@ class BinaryInstruction(Instruction):
     def __str__(self):
         return "%s %s, %s" % (self.opcode.mnemonic, self.b, self.a)
 
-    def assemble(self, symbols=None):
+    def copy(self):
+        return BinaryInstruction(self.opcode, self.b.copy(), self.a.copy())
+
+    @property
+    def is_resolved(self):
+        return self.b.is_resolved and self.a.is_resolved
+
+    def resolve(self, symbols, require=False):
+        self.b.resolve(symbols, require)
+        self.a.resolve(symbols, require)
+
+    def optimize(self):
+        b_opt = self.b.optimize()
+        a_opt = self.a.optimize()
+        if b_opt is not self.b or a_opt is not self.a:
+            return BinaryInstruction(self.opcode, b_opt, a_opt)
+        return self
+
+    @property
+    def base_cost(self):
+        return self.opcode.base_cost + self.b.decode_cost + self.a.decode_cost
+
+    def assemble(self):
         data = array.array(WORD_ARRAY)
-        b_code, b_next = self.b.assemble(symbols)
-        a_code, a_next = self.a.assemble(symbols)
+        b_code, b_next = self.b.assemble()
+        a_code, a_next = self.a.assemble()
         data.append(self.opcode.number | (a_code << 10) | (b_code << 5))
         if a_next is not None:
             data.append(a_next)
@@ -367,9 +447,29 @@ class SpecialInstruction(Instruction):
     def __str__(self):
         return "%s %s" % (self.opcode.mnemonic, self.a)
 
-    def assemble(self, symbols=None):
+    def copy(self):
+        return SpecialInstruction(self.opcode, self.a.copy())
+
+    @property
+    def is_resolved(self):
+        return self.a.is_resolved
+
+    def resolve(self, symbols, require=False):
+        self.a.resolve(symbols, require)
+
+    def optimize(self):
+        a_opt = self.a.optimize()
+        if a_opt is not self.a:
+            return SpecialInstruction(self.opcode, b_opt, a_opt)
+        return self
+
+    @property
+    def base_cost(self):
+        return self.opcode.base_cost + self.a.decode_cost
+
+    def assemble(self):
         data = array.array(WORD_ARRAY)
-        a_code, a_next = self.a.assemble(symbols)
+        a_code, a_next = self.a.assemble()
         data.append((self.opcode.number << 5) | (a_code << 10))
         if a_next is not None:
             data.append(a_next)
@@ -378,14 +478,6 @@ class SpecialInstruction(Instruction):
     @property
     def size(self):
         return 1 + (1 if self.a.uses_next else 0)
-
-
-def resolve_symbol(sym, symbols):
-    if isinstance(sym, basestring):
-        if symbols is None or sym not in symbols:
-            raise NameError("Undefined symbol '%s'" % sym)
-        return symbols[sym]
-    return sym
 
 
 class Address(object):
@@ -412,8 +504,42 @@ class Address(object):
         """
         return self.display_load()
 
+    def copy(self):
+        """
+        Creates a copy of this address, so that this address will not
+        be affected by further symbol resolution on the copy.
+        (Actually copying it is optional, if symbol resolution is
+        guaranteed not to affect this address.)
+        """
+        return self
+
+    def is_resolved(self):
+        """
+        Indicates whether this address contains any unresolved symbol
+        references (and therefore cannot be assembled).
+        """
+        return True
+
+    def resolve(self, symbols, require=False):
+        """
+        Resolves any symbol references in this address, using the
+        contents of `symbols`. (`resolve_symbol` is useful for this.)
+
+        :param symbols: A dictionary of symbols.
+        :param require: If `True`, a `NameError` should be thrown when a
+                        symbol cannot be resolved. If `False`, the symbol
+                        should simply be left unresolved.
+        """
+
+    def optimize(self):
+        """
+        Returns a more efficient copy of this instruction, if one exists.
+        (If one does not exist, it should return itself.)
+        """
+        return self
+
     @abc.abstractmethod
-    def assemble(self, symbols=None):
+    def assemble(self):
         """
         Returns the encoded version of this address, as a
         ``(value_code, next_word)`` tuple (with the next word being `None`
@@ -441,7 +567,7 @@ class Register(Address):
     def display_load(self):
         return REGISTERS[self.register]
 
-    def assemble(self, symbols=None):
+    def assemble(self):
         return 0x00 + self.register, None
 
 
@@ -459,7 +585,7 @@ class RegisterIndirect(Address):
     def display_load(self):
         return "[" + REGISTERS[self.register] + "]"
 
-    def assemble(self, symbols=None):
+    def assemble(self):
         return 0x08 + self.register, None
 
 
@@ -476,13 +602,33 @@ class RegisterIndirectDisplaced(Address):
     def __init__(self, register, displacement):
         self.register = register
         self.displacement = displacement
+        if isinstance(self.displacement, int):
+            self.displacement &= WORD_MASK
 
     def display_load(self):
         return "[%s + %s]" % (REGISTERS[self.register],
                               show_displacement(self.displacement))
 
-    def assemble(self, symbols=None):
-        return 0x10 + self.register, resolve_symbol(self.displacement, symbols)
+    def copy(self):
+        return RegisterIndirectDisplaced(self.register, self.displacement)
+
+    @property
+    def is_resolved(self):
+        return not isinstance(self.displacement, basestring)
+
+    def resolve(self, symbols, require=False):
+        self.displacement = resolve_symbol(self.displacement,
+                                           symbols, require)
+        if isinstance(self.displacement, int):
+            self.displacement &= WORD_MASK
+
+    def optimize(self):
+        if self.displacement == 0:
+            return RegisterIndirect(self.register)
+        return self
+
+    def assemble(self):
+        return 0x10 + self.register, self.displacement
 
     uses_next = True
     decode_cost = 1
@@ -497,7 +643,7 @@ class PushPopAddress(Address):
     def display_store(self):
         return "PUSH"
 
-    def assemble(self, symbols=None):
+    def assemble(self):
         return 0x18, None
 
 
@@ -512,7 +658,7 @@ class PeekAddress(Address):
     def display_load(self):
         return "[SP]"
 
-    def assemble(self, symbols=None):
+    def assemble(self):
         return 0x19, None
 
 
@@ -531,11 +677,31 @@ class Pick(Address):
 
     def __init__(self, displacement):
         self.displacement = displacement
+        if isinstance(self.displacement, int):
+            self.displacement &= WORD_MASK
 
     def display_load(self):
         return "[SP + %s]" % show_displacement(self.displacement)
 
-    def assemble(self, symbols=None):
+    def copy(self):
+        return Pick(self.displacement)
+
+    @property
+    def is_resolved(self):
+        return not isinstance(self.displacement, basestring)
+
+    def resolve(self, symbols, require=False):
+        self.displacement = resolve_symbol(self.displacement,
+                                           symbols, require)
+        if isinstance(self.displacement, int):
+            self.displacement &= WORD_MASK
+
+    def optimize(self):
+        if self.displacement == 0:
+            return PEEK
+        return self
+
+    def assemble(self):
         return 0x1a, resolve_symbol(self.displacement, symbols)
 
     uses_next = True
@@ -552,7 +718,7 @@ class SpecialRegister(Address):
     def display_load(self):
         return self.name
 
-    def assemble(self, symbols=None):
+    def assemble(self):
         return self.code, None
 
 
@@ -576,14 +742,28 @@ class Displacement(Address):
 
     def __init__(self, address):
         self.address = address
+        if isinstance(self.address, int):
+            self.address &= WORD_MASK
 
     def display_load(self):
         if isinstance(self.address, str):
             return "[%s]" % self.address
         return "[0x%04x]" % self.address
 
-    def assemble(self, symbols=None):
-        return 0x1e, resolve_symbol(self.address, symbols)
+    def copy(self):
+        return Displacement(self.address)
+
+    @property
+    def is_resolved(self):
+        return not isinstance(self.address, basestring)
+
+    def resolve(self, symbols, require=False):
+        self.address = resolve_symbol(self.address, symbols, require)
+        if isinstance(self.address, int):
+            self.address &= WORD_MASK
+
+    def assemble(self):
+        return 0x1e, self.address
 
     uses_next = True
     decode_cost = 1
@@ -599,12 +779,31 @@ class Immediate(Address):
 
     def __init__(self, value):
         self.value = value
+        if isinstance(self.value, int):
+            self.value &= WORD_MASK
 
     def display_load(self):
         return show_maybe_address(self.value)
 
-    def assemble(self, symbols=None):
-        return 0x1f, resolve_symbol(self.value, symbols)
+    def copy(self):
+        return Immediate(self.value)
+
+    @property
+    def is_resolved(self):
+        return not isinstance(self.value, basestring)
+
+    def resolve(self, symbols, require=False):
+        self.value = resolve_symbol(self.value, symbols, require)
+        if isinstance(self.value, int):
+            self.value &= WORD_MASK
+
+    def optimize(self):
+        if self.is_resolved and (self.value == 0xFFFF or self.value < 0x1E):
+            return QuickImmediate(self.value)
+        return self
+
+    def assemble(self):
+        return 0x1f, self.value
 
     uses_next = True
     decode_cost = 1
@@ -616,7 +815,9 @@ class QuickImmediate(Immediate):
     """
     __slots__ = ()
 
-    def assemble(self, symbols=None):
+    def assemble(self):
+        if self.value == 0xFFFF:
+            return 0x20, None
         return 0x21 + self.value, None
 
     uses_next = False
