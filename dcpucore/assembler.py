@@ -210,12 +210,9 @@ class AssemblyLexer(object):
     :param single: If `False` (the default), the start rule will be
                    "one or more instructions." If `True`, the start rule
                    will be "one instruction."
-    :param suppress_keywords: A quick way to disable assembler features
-                              you don't want. This is a list of keywords
-                              to not lex as keywords, which will result
-                              in the corresponding directives not being
-                              parsed. (For example, to disable ``.ORG``,
-                              you could pass ``suppress_keywords=['.ORG']``.)
+    :param keywords: These identifiers will be parsed as a specific token
+                     type, instead of as a generic `ID` token. (If they
+                     start with ``.``, it will be in the form ``DOT_WORD``.)
     :param lex_debug: If `True`, PLY will generate rather annoying debugging
                       output.
     """
@@ -342,25 +339,17 @@ class AssemblyParser(object):
     :param single: If `False` (the default), the start rule will be
                    "one or more instructions." If `True`, the start rule
                    will be "one instruction."
-    :param suppress_keywords: A quick way to disable assembler features
-                              you don't want. This is a list of keywords
-                              to not lex as keywords, which will result
-                              in the corresponding directives not being
-                              parsed. (For example, to disable ``.ORG``,
-                              you could pass ``suppress_keywords=['.ORG']``.)
     :param yacc_debug: If `True`, PLY will generate rather annoying debugging
                        output.
     """
     def __init__(self, instruction_set=DCPU_17, single=False,
-                 suppress_keywords=(), yacc_debug=False):
+                 yacc_debug=False):
         self.isa = instruction_set
 
         self.keywords = set()
         for name, item in inspect.getmembers(self):
             if inspect.ismethod(item) and getattr(item, 'asm_keywords', ()):
                 self.keywords.update(item.asm_keywords)
-        for keyword in suppress_keywords:
-            self.keywords.discard(keyword)
 
         self.lexer = self.create_lexer(yacc_debug)
         self.tokens = self.lexer.tokens
