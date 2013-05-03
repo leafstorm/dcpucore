@@ -276,7 +276,7 @@ class Emulator(object):
             return self.ex
 
         elif isinstance(address, Displacement):
-            return self.memory[address.displacement]
+            return self.memory[address.address]
         elif isinstance(address, Immediate):
             return address.value
 
@@ -290,7 +290,7 @@ class Emulator(object):
         :param address: An `Address` where the value will be stored.
         :param value: The value to store there.
         """
-        value = (0x10000 + value if value < 0 else value) & WORD_MASK
+        value = value & WORD_MASK
 
         if isinstance(address, Register):
             self.registers[address.register] = value
@@ -373,6 +373,7 @@ class Emulator(object):
                 return inst.base_cost
             else:
                 return inst.base_cost + self.skip_instructions()
+        return opcode
 
     def SET(self, inst, b, a):
         self.store(b, self.load(a))
@@ -498,11 +499,13 @@ class Emulator(object):
         self.store(b, self.load(a))
         self.registers[I] = (self.registers[I] + 1) & WORD_MASK
         self.registers[J] = (self.registers[J] + 1) & WORD_MASK
+        return inst.base_cost
 
     def STD(self, inst, b, a):
         self.store(b, self.load(a))
         self.registers[I] = (self.registers[I] - 1) & WORD_MASK
         self.registers[J] = (self.registers[J] - 1) & WORD_MASK
+        return inst.base_cost
 
     del arithmetic_opcode, if_arithmetic_opcode, ex_arithmetic_opcode
 
@@ -516,27 +519,27 @@ class Emulator(object):
 
     def INT(self, inst, a):
         self.interrupt(self.load(a))
-        return self.base_cost
+        return inst.base_cost
 
     def IAG(self, inst, a):
         self.store(a, self.ia)
-        return self.base_cost
+        return inst.base_cost
 
     def IAS(self, inst, a):
         self.ia = self.load(a)
-        return self.base_cost
+        return inst.base_cost
 
     def IAQ(self, inst, a):
         self.int_queue_enabled = bool(self.load(a))
-        return self.base_cost
+        return inst.base_cost
 
     def HWN(self, inst, a):
         self.store(a, len(self.hardware))
-        return self.base_cost
+        return inst.base_cost
 
     def HWQ(self, inst, a):
-        return self.base_cost
+        return inst.base_cost
 
     def HWI(self, inst, a):
         hw = self.load(a)
-        return self.base_cost
+        return inst.base_cost

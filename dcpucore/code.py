@@ -270,19 +270,7 @@ class InstructionSet(object):
             if opcode is None:
                 opcode = UnknownOpcode(BINARY, opcode_number)
 
-            a_code = (code_word >> 5) & 0x1f
-            if offset < buflen:
-                a, word_used = self._decode_address(a_code, buffer[offset])
-                if word_used:
-                    source.append(buffer[offset])
-                    offset = (offset + 1) % buflen if wrap else offset + 1
-            else:
-                a, word_used = self._decode_address(a_code, 0x0000)
-                if word_used:
-                    raise IndexError("address %02x required a read past "
-                                     "the end of the buffer" % a_code)
-
-            b_code = code_word >> 10
+            b_code = (code_word >> 5) & 0x1f
             if offset < buflen:
                 b, word_used = self._decode_address(b_code, buffer[offset])
                 if word_used:
@@ -294,12 +282,24 @@ class InstructionSet(object):
                     raise IndexError("address %02x required a read past "
                                      "the end of the buffer" % b_code)
 
+            a_code = code_word >> 10
+            if offset < buflen:
+                a, word_used = self._decode_address(a_code, buffer[offset])
+                if word_used:
+                    source.append(buffer[offset])
+                    offset = (offset + 1) % buflen if wrap else offset + 1
+            else:
+                a, word_used = self._decode_address(a_code, 0x0000)
+                if word_used:
+                    raise IndexError("address %02x required a read past "
+                                     "the end of the buffer" % a_code)
+
             return BinaryInstruction(opcode, b, a, start_offset, source)
 
     def _decode_address(self, lead, next_word):
         if lead >= 0x20:
             # Quick immediate value (-1 to 30)
-            return QuickImmediate(unsign_word((lead & 0x1f) - 1)), False
+            return QuickImmediate(((lead & 0x1f) - 1) & WORD_MASK), False
         elif lead >= 0x18:
             # Special value
             if lead == 0x18:
@@ -321,10 +321,10 @@ class InstructionSet(object):
         else:
             # Register-linked value
             control = lead & 0x18
-            if lead == 0x10:
+            if control == 0x10:
                 # [Register + displacement]
                 return RegisterIndirectDisplaced(lead & 0x07, next_word), True
-            elif lead == 0x08:
+            elif control == 0x08:
                 # [Register]
                 return RegisterIndirect(lead & 0x07), False
             else:
