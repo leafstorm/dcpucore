@@ -7,6 +7,8 @@ Metadata and tools for manipulating instructions.
 :copyright: (C) 2013 Matthew Frazier
 :license:   MIT/X11 -- see the LICENSE file for details
 """
+from .errors import (AssemblyError, AssemblySyntaxError, AssemblySymbolError,
+                     SourceReference)
 from .words import WORD_ARRAY, WORD_MASK
 import abc
 import array
@@ -103,6 +105,19 @@ class Opcode(object):
 
     def __str__(self):
         return "%s (%s %02x)" % (self.mnemonic, self.type, self.number)
+
+
+class UnknownOpcode(Opcode):
+    """
+    This represents an unknown opcode.
+    """
+    def __init__(self, type, number):
+        self.type = type
+        self.number = number
+        self.mnemonic = type[0].upper() + "%02X" % number
+        self.cost = 0
+        self.flags = 0
+        self.comment = "unrecognized (%s opcode 0x%02x)" % (type, number)
 
 
 class InstructionSet(object):
@@ -232,6 +247,8 @@ class InstructionSet(object):
             # Special instruction
             spec_opcode_number = (code_word >> 5) & 0x1f
             opcode = self.opcodes[SPECIAL][spec_opcode_number]
+            if opcode is None:
+                opcode = UnknownOpcode(SPECIAL, opcode_number)
 
             a_code = code_word >> 10
             if offset < buflen:
@@ -250,6 +267,8 @@ class InstructionSet(object):
         else:
             # Binary instruction
             opcode = self.opcodes[BINARY][opcode_number]
+            if opcode is None:
+                opcode = UnknownOpcode(BINARY, opcode_number)
 
             a_code = (code_word >> 5) & 0x1f
             if offset < buflen:
@@ -312,22 +331,72 @@ class InstructionSet(object):
                 # Register
                 return Register(lead & 0x07), False
 
+    def get_instruction_size(self, lead):
+        """
+        Determines the size of an instruction in words, based on its first
+        word.
 
-def resolve_symbol(sym, symbols, require=False):
+        :param lead: The first word of the instruction.
+        """
+        long_codes = frozenset((0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+                                0x17, 0x1a, 0x1e, 0x1f))
+
+        size = 1
+        opcode_number = lead & 0x1f
+        if opcode_number == 0:
+            # Special instruction
+            spec_opcode_number = (lead >> 5) & 0x1f
+            opcode = self.opcodes[SPECIAL][spec_opcode_number]
+
+            if a_code >> 10 in long_codes:
+                size += 1
+        else:
+            # Binary instruction
+            opcode = self.opcodes[BINARY][opcode_number]
+
+            if (lead >> 5) & 0x1f in long_codes:
+                size += 1
+            if lead >> 10 in long_codes:
+                size += 1
+
+        return size
+
+    def is_conditional_instruction(self, lead):
+        """
+        Determines whether an instruction is a conditional instruction
+        (and therefore should be skipped)
+
+        :param lead: The first word of the instruction.
+        """
+        opcode_number = lead & 0x1f
+        if opcode_number == 0:
+            # Special instruction
+            spec_opcode_number = (lead >> 5) & 0x1f
+            opcode = self.opcodes[SPECIAL][spec_opcode_number]
+        else:
+            # Binary instruction
+            opcode = self.opcodes[BINARY][opcode_number]
+
+        return bool(opcode.flags & Opcode.CONDITIONAL)
+
+
+def resolve_symbol(sym, symbols, require=False, error_source=None):
     """
     Looks up a symbol in the provided dictionary.
 
     :param sym: A symbol name. This will be returned as-is if it is not a
     string.
     :param symbols: A dictionary mapping symbol names to values.
-    :param require: If `True`, a `NameError` will be thrown when a
+    :param require: If `True`, an `AssemblySymbolError` will be raised when a
                     symbol cannot be resolved. If `False`, the symbol
                     will simply be left unresolved.
+    :param error_source: A `SourceReference` to use if an
+                         `AssemblySymbolError` is raised.
     """
     if isinstance(sym, basestring):
         if symbols is None or sym not in symbols:
             if require:
-                raise NameError("Undefined symbol '%s'" % sym)
+                raise AssemblySymbolError(sym, error_source)
             else:
                 return sym
         return symbols[sym]
@@ -413,14 +482,15 @@ class BinaryInstruction(Instruction):
         self.a = a
         #: The offset this instruction was decoded from.
         self.offset = offset
-        #: An `array.array` of words this instruction was decoded from.
+        #: The file and line this instruction was defined at (if known).
         self.source = source
 
     def __str__(self):
         return "%s %s, %s" % (self.opcode.mnemonic, self.b, self.a)
 
     def copy(self):
-        return BinaryInstruction(self.opcode, self.b.copy(), self.a.copy())
+        return BinaryInstruction(self.opcode, self.b.copy(), self.a.copy(),
+                                 self.offset, self.source)
 
     @property
     def is_resolved(self):
@@ -472,14 +542,15 @@ class SpecialInstruction(Instruction):
         self.a = a
         #: The offset this instruction was decoded from.
         self.offset = offset
-        #: An `array.array` of words this instruction was decoded from.
+        #: The file and line this instruction was defined at (if known).
         self.source = source
 
     def __str__(self):
         return "%s %s" % (self.opcode.mnemonic, self.a)
 
     def copy(self):
-        return SpecialInstruction(self.opcode, self.a.copy())
+        return SpecialInstruction(self.opcode, self.a.copy(),
+                                  self.offset, self.source)
 
     @property
     def is_resolved(self):
@@ -517,7 +588,7 @@ class Address(object):
     addressing mode.
     """
     __metaclass__ = abc.ABCMeta
-    __slots__ = ()
+    __slots__ = ('source',)
 
     def __str__(self):
         return self.display_load()
@@ -557,9 +628,9 @@ class Address(object):
         contents of `symbols`. (`resolve_symbol` is useful for this.)
 
         :param symbols: A dictionary of symbols.
-        :param require: If `True`, a `NameError` should be thrown when a
-                        symbol cannot be resolved. If `False`, the symbol
-                        should simply be left unresolved.
+        :param require: If `True`, an `AssemblySymbolError` should be thrown
+                        when a symbol cannot be resolved. If `False`, the
+                        symbol should simply be left unresolved.
         """
 
     def optimize(self):
@@ -592,8 +663,9 @@ class Register(Address):
     """
     __slots__ = ('register',)
 
-    def __init__(self, register):
+    def __init__(self, register, source=None):
         self.register = register
+        self.source = None
 
     def display_load(self):
         return REGISTERS[self.register]
@@ -610,8 +682,9 @@ class RegisterIndirect(Address):
     """
     __slots__ = ('register',)
 
-    def __init__(self, register):
+    def __init__(self, register, source=None):
         self.register = register
+        self.source = source
 
     def display_load(self):
         return "[" + REGISTERS[self.register] + "]"
@@ -630,18 +703,20 @@ class RegisterIndirectDisplaced(Address):
     """
     __slots__ = ('register', 'displacement',)
 
-    def __init__(self, register, displacement):
+    def __init__(self, register, displacement, source=None):
         self.register = register
         self.displacement = displacement
         if isinstance(self.displacement, int):
             self.displacement &= WORD_MASK
+        self.source = source
 
     def display_load(self):
         return "[%s + %s]" % (REGISTERS[self.register],
                               show_displacement(self.displacement))
 
     def copy(self):
-        return RegisterIndirectDisplaced(self.register, self.displacement)
+        return RegisterIndirectDisplaced(self.register, self.displacement,
+                                         self.source)
 
     @property
     def is_resolved(self):
@@ -649,7 +724,7 @@ class RegisterIndirectDisplaced(Address):
 
     def resolve(self, symbols, require=False):
         self.displacement = resolve_symbol(self.displacement,
-                                           symbols, require)
+                                           symbols, require, self.source)
         if isinstance(self.displacement, int):
             self.displacement &= WORD_MASK
 
@@ -706,16 +781,17 @@ class Pick(Address):
     """
     __slots__ = ('displacement',)
 
-    def __init__(self, displacement):
+    def __init__(self, displacement, source=None):
         self.displacement = displacement
         if isinstance(self.displacement, int):
             self.displacement &= WORD_MASK
+        self.source = source
 
     def display_load(self):
         return "[SP + %s]" % show_displacement(self.displacement)
 
     def copy(self):
-        return Pick(self.displacement)
+        return Pick(self.displacement, self.source)
 
     @property
     def is_resolved(self):
@@ -723,7 +799,7 @@ class Pick(Address):
 
     def resolve(self, symbols, require=False):
         self.displacement = resolve_symbol(self.displacement,
-                                           symbols, require)
+                                           symbols, require, self.source)
         if isinstance(self.displacement, int):
             self.displacement &= WORD_MASK
 
@@ -733,7 +809,7 @@ class Pick(Address):
         return self
 
     def assemble(self):
-        return 0x1a, resolve_symbol(self.displacement, symbols)
+        return 0x1a, self.displacement
 
     uses_next = True
     decode_cost = 1
@@ -771,10 +847,11 @@ class Displacement(Address):
     """
     __slots__ = ('address',)
 
-    def __init__(self, address):
+    def __init__(self, address, source=None):
         self.address = address
         if isinstance(self.address, int):
             self.address &= WORD_MASK
+        self.source = source
 
     def display_load(self):
         if isinstance(self.address, str):
@@ -782,14 +859,15 @@ class Displacement(Address):
         return "[0x%04x]" % self.address
 
     def copy(self):
-        return Displacement(self.address)
+        return Displacement(self.address, self.source)
 
     @property
     def is_resolved(self):
         return not isinstance(self.address, basestring)
 
     def resolve(self, symbols, require=False):
-        self.address = resolve_symbol(self.address, symbols, require)
+        self.address = resolve_symbol(self.address, symbols, require,
+                                      self.source)
         if isinstance(self.address, int):
             self.address &= WORD_MASK
 
@@ -808,23 +886,24 @@ class Immediate(Address):
     """
     __slots__ = ('value',)
 
-    def __init__(self, value):
+    def __init__(self, value, source=None):
         self.value = value
         if isinstance(self.value, int):
             self.value &= WORD_MASK
+        self.source = source
 
     def display_load(self):
         return show_maybe_address(self.value)
 
     def copy(self):
-        return Immediate(self.value)
+        return Immediate(self.value, self.source)
 
     @property
     def is_resolved(self):
         return not isinstance(self.value, basestring)
 
     def resolve(self, symbols, require=False):
-        self.value = resolve_symbol(self.value, symbols, require)
+        self.value = resolve_symbol(self.value, symbols, require, self.source)
         if isinstance(self.value, int):
             self.value &= WORD_MASK
 

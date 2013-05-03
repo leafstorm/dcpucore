@@ -15,11 +15,13 @@ import array
 import inspect
 import ply.lex as lex
 import ply.yacc as yacc
-from .code import (DCPU_17, resolve_symbol,
+from .code import (DCPU_17, resolve_symbol, AssemblyError,
                    BinaryInstruction, SpecialInstruction,
                    Register, RegisterIndirect, RegisterIndirectDisplaced,
                    Displacement, Immediate, QuickImmediate,
                    PUSHPOP, PEEK, Pick, SP, PC, EX)
+from .errors import (AssemblyError, AssemblySyntaxError, AssemblySymbolError,
+                     SourceReference)
 from .words import WORD_ARRAY, WORD_MASK
 
 class Program(object):
@@ -93,12 +95,14 @@ class Label(object):
     :param name: The symbol's name.
     :param offset: A specific offset to used, if it can't be determined
                    automatically.
+    :param source: The location where the label was defined.
     """
-    def __init__(self, name, offset=None):
+    def __init__(self, name, offset=None, source=None):
         self.name = name
         self.size = 0
         self.is_resolved = True
         self.offset = offset
+        self.source = source
 
     def __str__(self):
         return ":%s" % self.name
@@ -119,25 +123,27 @@ class Equate(object):
 
     :param name: The symbol's name.
     :param value: The symbol's value.
+    :param source: The location where the equate was defined.
     """
-    def __init__(self, name, value):
+    def __init__(self, name, value, source=None):
         self.name = name
         self.size = 0
         self.offset = None
         self.value = value
+        self.source = source
 
     def __str__(self):
         return ":%s equ %s" % self.value
 
     def copy(self):
-        return Equate(self.name, self.value)
+        return Equate(self.name, self.value, self.source)
 
     @property
     def is_resolved(self):
         return not isinstance(self.value, basestring)
 
     def resolve(self, symbols, require=False):
-        self.value = resolve_symbol(self.value, symbols, require)
+        self.value = resolve_symbol(self.value, symbols, require, self.source)
 
     def assemble(self):
         return []
@@ -149,11 +155,13 @@ class Origin(object):
     the code -- the DCPU must take care of moving any code necessary.)
 
     :param offset: The new offset to generate code for.
+    :param source: The location where the equate was defined.
     """
-    def __init__(self, offset):
+    def __init__(self, offset, source=None):
         self.size = 0
         self.is_resolved = True
         self.offset = offset
+        self.source = source
 
     def __str__(self):
         return ".ORG 0x%04x" % self.offset
@@ -173,17 +181,19 @@ class Data(object):
     Represents a block of data in an instruction stream.
 
     :param data: A tuple of words (either actual integers or symbols).
+    :param source: The location where the equate was defined.
     """
-    def __init__(self, data):
+    def __init__(self, data, source=None):
         self.data = data
         self.offset = None
         self.size = len(self.data)
+        self.source = source
 
     def __str__(self):
         return "DAT " + ", ".join(str(x) for x in self.data)
 
     def copy(self):
-        return Data(self.data)
+        return Data(self.data, self.source)
 
     @property
     def is_resolved(self):
@@ -191,7 +201,8 @@ class Data(object):
 
     def resolve(self, symbols, require=False):
         self.data = tuple(
-            resolve_symbol(d, symbols, require) for d in self.data
+            resolve_symbol(d, symbols, require, self.source)
+            for d in self.data
         )
 
     def assemble(self):
@@ -227,6 +238,8 @@ class AssemblyLexer(object):
         self.tokens.extend(self.isa.SPECIAL_OPERATIONS)
         self.tokens.extend(t.upper() + '_OP' for t in self.isa.opcodes)
         self.lexer = lex.lex(module=self, debug=lex_debug)
+
+        self.filenames = []
 
     base_tokens = (
         'LBRACK',
@@ -308,9 +321,22 @@ class AssemblyLexer(object):
             t.type = 'ID'
         return t
 
+    def file_start(self, filename):
+        self.filenames.append(filename)
+
+    def file_complete(self, filename):
+        if self.filenames[-1] != filename:
+            raise Exception("Completed file %r is not current file %r!" %
+                            (filename, self.filenames[-1]))
+        self.filenames.pop()
+
+    def get_source(self, t):
+        return SourceReference(self.filenames[-1] if self.filenames else None,
+                               t.lineno)
+
     def t_error(self, t):
-        raise Exception('Unrecognized token on line %d: %s' %
-                        (t.lineno, t.value))
+        raise AssemblySyntaxError('Unexpected character %r' % t.value[0],
+                                  self.get_source(t))
 
 
 def keyword(*words):
@@ -355,6 +381,7 @@ class AssemblyParser(object):
         self.tokens = self.lexer.tokens
         self.start = 'instruction' if single is True else 'instructions'
 
+        self.filenames = []
         self.parser = yacc.yacc(module=self, debug=yacc_debug,
                                 write_tables=False)
 
@@ -374,7 +401,30 @@ class AssemblyParser(object):
         :param source: The assembly source to parse.
         :param filename: The name of the file it was read from.
         """
-        return self.parser.parse(source, lexer=self.lexer.lexer)
+        if filename:
+            self.file_start(filename)
+            inst = self.parser.parse(source, lexer=self.lexer.lexer)
+            self.file_complete(filename)
+            return inst
+        else:
+            return self.parser.parse(source, lexer=self.lexer.lexer)
+
+
+    def file_start(self, filename):
+        self.filenames.append(filename)
+        self.lexer.file_start(filename)
+
+    def file_complete(self, filename):
+        if self.filenames[-1] != filename:
+            raise Exception("Completed file %r is not current file %r!" %
+                            (filename, self.filenames[-1]))
+        self.filenames.pop()
+        self.lexer.file_complete(filename)
+
+    def get_source(self, p, n):
+        return SourceReference(self.filenames[-1] if self.filenames else None,
+                               p.lineno(n))
+
 
     def p_instructions(self, t):
         'instructions : instruction instructions'
@@ -401,30 +451,27 @@ class AssemblyParser(object):
     @keyword('DAT')
     def p_instruction_data(self, t):
         'instruction : DAT data'
-        t[0] = Data(t[2])
+        t[0] = Data(t[2], self.get_source(t, 1))
 
     @keyword('.ORG')
     def p_instruction_org(self, t):
         'instruction : DOT_ORG number_literal'
-        t[0] = Origin(t[2])
+        t[0] = Origin(t[2], self.get_source(t, 1))
 
     @keyword('EQU')
     def p_instruction_equ(self, t):
         'instruction : LABEL EQU number'
-        t[0] = Equate(t[1], t[3])
+        t[0] = Equate(t[1], t[3], self.get_source(t, 1))
 
     def p_instruction_label(self, t):
         'instruction : LABEL'
-        t[0] = Label(t[1])
+        t[0] = Label(t[1], self.get_source(t, 1))
 
 
     def p_instruction_binary(self, t):
         'instruction : BINARY_OP address address'
-        a = t[3]
-        if (isinstance(a, Immediate) and isinstance(a.value, int) and
-                    a.value >= -1 and a.value <= 30):
-            a = QuickImmediate(a.value)
-        t[0] = BinaryInstruction(self.isa.by_mnemonic[t[1]], t[2], a)
+        t[0] = BinaryInstruction(self.isa.by_mnemonic[t[1]], t[2], t[3],
+                                 self.get_source(t, 1))
 
     def p_instruction_special(self, t):
         'instruction : SPECIAL_OP address'
@@ -432,24 +479,25 @@ class AssemblyParser(object):
         if (isinstance(a, Immediate) and isinstance(a.value, int) and
                     a.value >= -1 and a.value <= 30):
             a = QuickImmediate(a.value)
-        t[0] = SpecialInstruction(self.isa.by_mnemonic[t[1]], a)
+        t[0] = SpecialInstruction(self.isa.by_mnemonic[t[1]], a,
+                                  self.get_source(t, 1))
 
 
     def p_address_register(self, t):
         'address : GP_REG'
-        t[0] = Register(t[1])
+        t[0] = Register(t[1], self.get_source(t, 1))
 
     def p_address_register_indirect(self, t):
         'address : LBRACK GP_REG RBRACK'
-        t[0] = RegisterIndirect(t[2])
+        t[0] = RegisterIndirect(t[2], self.get_source(t, 2))
 
     def p_address_register_indirect_displaced_l(self, t):
         'address : LBRACK GP_REG PLUS number RBRACK'
-        t[0] = RegisterIndirectDisplaced(t[2], t[4])
+        t[0] = RegisterIndirectDisplaced(t[2], t[4], self.get_source(t, 4))
 
     def p_address_register_indirect_displaced_r(self, t):
         'address : LBRACK number PLUS GP_REG RBRACK'
-        t[0] = RegisterIndirectDisplaced(t[4], t[2])
+        t[0] = RegisterIndirectDisplaced(t[4], t[2], self.get_source(t, 2))
 
     def p_address_push_pop(self, t):
         """
@@ -469,15 +517,15 @@ class AssemblyParser(object):
 
     def p_address_pick_l(self, t):
         'address : LBRACK SP PLUS number RBRACK'
-        t[0] = Pick(t[4])
+        t[0] = Pick(t[4], self.get_source(t, 4))
 
     def p_address_pick_r(self, t):
         'address : LBRACK number PLUS SP RBRACK'
-        t[0] = Pick(t[2])
+        t[0] = Pick(t[2], self.get_source(t, 2))
 
     def p_address_pick_k(self, t):
         'address : PICK number'
-        t[0] = Pick(t[2])
+        t[0] = Pick(t[2], self.get_source(t, 2))
 
     def p_address_sp(self, t):
         'address : SP'
@@ -493,11 +541,11 @@ class AssemblyParser(object):
 
     def p_address_displacement(self, t):
         'address : LBRACK number RBRACK'
-        t[0] = Displacement(t[2])
+        t[0] = Displacement(t[2], self.get_source(t, 2))
 
     def p_address_immediate(self, t):
         'address : number'
-        t[0] = Immediate(t[1])
+        t[0] = Immediate(t[1], self.get_source(t, 1))
 
 
     def p_number(self, t):
@@ -507,6 +555,7 @@ class AssemblyParser(object):
                   | ID
                   | CHAR'''
         t[0] = t[1]
+        t.set_lineno(0, t.lineno(1))
 
     def p_number_literal(self, t):
         '''number_literal : DECIMAL
@@ -514,7 +563,10 @@ class AssemblyParser(object):
                           | OCT
                           | CHAR'''
         t[0] = t[1]
+        t.set_lineno(0, t.lineno(1))
 
 
     def p_error(self, t):
-        raise Exception('Invalid token on line %d: %s' % (t.lineno, t.value))
+        src = SourceReference(self.filenames[-1] if self.filenames else None,
+                              t.lineno)
+        raise AssemblySyntaxError('Misplaced token: %r' % t.value, src)

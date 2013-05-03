@@ -31,8 +31,10 @@ Options:
 :license:   MIT/X11 -- see the LICENSE file for details
 """
 import dcpucore.assembler
+import os.path
 import sys
 from docopt import docopt
+from dcpucore.errors import DCPUError
 
 def error(message, code=1):
     print >>sys.stderr, message
@@ -47,43 +49,49 @@ parser = dcpucore.assembler.AssemblyParser(yacc_debug=options['--debug'])
 if options['<filename>']:
     with open(options['<filename>']) as fd:
         source = fd.read()
+    filename = os.path.basename(options['<filename>'])
 else:
     source = sys.stdin.read()
+    filename = None
 
-instructions = parser.parse(source)
+try:
+    instructions = parser.parse(source, filename)
 
-if options['<output_filename>']:
-    output = open(options['<output_filename>'], 'w')
-else:
-    output = sys.stdout
-
-if options['--parse']:
-    for inst in instructions:
-        print >>output, inst
-else:
-    program = dcpucore.assembler.Program(instructions)
-    if options['--pass-1']:
-        for inst in program.instructions:
-            print >>output, "0x%04x: %s" % (inst.offset, inst)
+    if options['<output_filename>']:
+        output = open(options['<output_filename>'], 'w')
     else:
-        assembled = program.assemble()
+        output = sys.stdout
 
-        if options['--pass-2']:
+    if options['--parse']:
+        for inst in instructions:
+            print >>output, inst
+    else:
+        program = dcpucore.assembler.Program(instructions)
+        if options['--pass-1']:
             for inst in program.instructions:
                 print >>output, "0x%04x: %s" % (inst.offset, inst)
-        elif options['--dat']:
-            for n in range(0, len(assembled), 8):
-                print >>output, ("DAT " +
-                    ", ".join("0x%04x" % x for x in assembled[n:n + 8])
-                )
         else:
-            if options['--big-endian'] and options['--little-endian']:
-                error("Conflicting endianness requirements", 16)
-            elif options['--big-endian']:
-                if sys.byteorder != 'big':
-                    assembled.byteswap()
-            else:
-                if sys.byteorder != 'little':
-                    assembled.byteswap()
+            assembled = program.assemble()
 
-            assembled.tofile(output)
+            if options['--pass-2']:
+                for inst in program.instructions:
+                    print >>output, "0x%04x: %s" % (inst.offset, inst)
+            elif options['--dat']:
+                for n in range(0, len(assembled), 8):
+                    print >>output, ("DAT " +
+                        ", ".join("0x%04x" % x for x in assembled[n:n + 8])
+                    )
+            else:
+                if options['--big-endian'] and options['--little-endian']:
+                    error("Conflicting endianness requirements", 16)
+                elif options['--big-endian']:
+                    if sys.byteorder != 'big':
+                        assembled.byteswap()
+                else:
+                    if sys.byteorder != 'little':
+                        assembled.byteswap()
+
+                assembled.tofile(output)
+
+except DCPUError as e:
+    print >>sys.stderr, "Error: %s" % e
