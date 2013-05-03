@@ -54,20 +54,51 @@ class Opcode(object):
     :param number: The numeric value for this opcode.
     :param mnemonic: The assembler mnemonic (such as SET or ADX).
     :param cost: The base cost for this opcode (not including decode cost).
+    :param flags: Flags that categorize the effects of this opcode.
+                  If there are multiple flags, they should be bitwise-OR'ed
+                  together (like ``Opcode.CONDITIONAL | Opcode.SETS_EX``).
+                  0 means "no flags."
     :param comment: A human-readable explanation of what the opcode does.
     """
-    __slots__ = ('type', 'number', 'mnemonic', 'cost', 'comment')
+    __slots__ = ('type', 'number', 'mnemonic', 'cost', 'flags', 'comment')
 
-    def __init__(self, type, number, mnemonic, cost, comment=None):
+    #: A flag indicating that an opcode is conditional, and should trigger
+    #: an additional skip when skipping instructions after a conditional.
+    CONDITIONAL = 1 << 0
+
+    #: A flag indicating that an opcode modifies the EX register
+    #: (without being specifically instructed to).
+    SETS_EX = 1 << 1
+
+    _FLAG_NAMES = {
+        CONDITIONAL:    "Opcode.CONDITIONAL",
+        SETS_EX:        "Opcode.SETS_EX"
+    }
+
+    def __init__(self, type, number, mnemonic, cost, flags=0, comment=None):
+        #: This opcode's type -- `SPECIAL`, `BINARY`, or a hypothetical
+        #: future type.
         self.type = type
+        #: The number that selects this opcode.
         self.number = number
+        #: This opcode's assembler mnemonic.
         self.mnemonic = mnemonic
+        #: The base cost for executing this opcode.
         self.cost = cost
+        #: Flags that categorize the effects of this opcode.
+        self.flags = flags
+        #: A human-readable explanation of what this opcode does.
         self.comment = comment
 
     def __repr__(self):
-        return "Opcode(%r, %r, %r, %r, %r)" % (
-            self.type, self.number, self.mnemonic, self.cost, self.comment
+        flag_names = []
+        for flag, name in self._FLAG_NAMES.items():
+            if self.flags & flag:
+                flag_names.append(name)
+
+        return "Opcode(%r, 0x%02x, %r, %r, %s, %r)" % (
+            self.type, self.number, self.mnemonic, self.cost,
+            " | ".join(flag_names) if flag_names else "0", self.comment
         )
 
     def __str__(self):
@@ -244,7 +275,7 @@ class InstructionSet(object):
                     raise IndexError("address %02x required a read past "
                                      "the end of the buffer" % b_code)
 
-            return BinaryInstruction(opcode, a, b, start_offset, source)
+            return BinaryInstruction(opcode, b, a, start_offset, source)
 
     def _decode_address(self, lead, next_word):
         if lead >= 0x20:
@@ -408,7 +439,7 @@ class BinaryInstruction(Instruction):
 
     @property
     def base_cost(self):
-        return self.opcode.base_cost + self.b.decode_cost + self.a.decode_cost
+        return self.opcode.cost + self.b.decode_cost + self.a.decode_cost
 
     def assemble(self):
         data = array.array(WORD_ARRAY)
@@ -824,56 +855,61 @@ class QuickImmediate(Immediate):
     decode_cost = 0
 
 
+_EX, _COND = Opcode.SETS_EX, Opcode.CONDITIONAL
+
+
 #: A list of `Opcode` instances for the DCPU-16 1.7 standard.
 DCPU_17_OPCODES = (
-    Opcode(BINARY,  0x01,   "SET",  1,  "set"),
+    Opcode(BINARY,  0x01,   "SET",  1,  0,      "set"),
 
-    Opcode(BINARY,  0x02,   "ADD",  2,  "add"),
-    Opcode(BINARY,  0x03,   "SUB",  2,  "subtract"),
+    Opcode(BINARY,  0x02,   "ADD",  2,  _EX,    "add"),
+    Opcode(BINARY,  0x03,   "SUB",  2,  _EX,    "subtract"),
 
-    Opcode(BINARY,  0x04,   "MUL",  2,  "unsigned multiply"),
-    Opcode(BINARY,  0x05,   "MLI",  2,  "signed multiply"),
-    Opcode(BINARY,  0x06,   "DIV",  3,  "unsigned divide"),
-    Opcode(BINARY,  0x07,   "DVI",  3,  "signed divide"),
-    Opcode(BINARY,  0x08,   "MOD",  3,  "unsigned modulus"),
-    Opcode(BINARY,  0x09,   "MDI",  3,  "signed modulus"),
+    Opcode(BINARY,  0x04,   "MUL",  2,  _EX,    "unsigned multiply"),
+    Opcode(BINARY,  0x05,   "MLI",  2,  _EX,    "signed multiply"),
+    Opcode(BINARY,  0x06,   "DIV",  3,  _EX,    "unsigned divide"),
+    Opcode(BINARY,  0x07,   "DVI",  3,  _EX,    "signed divide"),
+    Opcode(BINARY,  0x08,   "MOD",  3,  _EX,    "unsigned modulus"),
+    Opcode(BINARY,  0x09,   "MDI",  3,  _EX,    "signed modulus"),
 
-    Opcode(BINARY,  0x0a,   "AND",  1,  "bitwise and"),
-    Opcode(BINARY,  0x0b,   "BOR",  1,  "bitwise or"),
-    Opcode(BINARY,  0x0c,   "XOR",  1,  "bitwise exclusive or"),
+    Opcode(BINARY,  0x0a,   "AND",  1,  0,      "bitwise and"),
+    Opcode(BINARY,  0x0b,   "BOR",  1,  0,      "bitwise or"),
+    Opcode(BINARY,  0x0c,   "XOR",  1,  0,      "bitwise exclusive or"),
 
-    Opcode(BINARY,  0x0d,   "SHR",  1,  "logical shift right"),
-    Opcode(BINARY,  0x0e,   "ASR",  1,  "arithmetic shift right"),
-    Opcode(BINARY,  0x0f,   "SHL",  1,  "logical shift left"),
+    Opcode(BINARY,  0x0d,   "SHR",  1,  _EX,    "logical shift right"),
+    Opcode(BINARY,  0x0e,   "ASR",  1,  _EX,    "arithmetic shift right"),
+    Opcode(BINARY,  0x0f,   "SHL",  1,  _EX,    "logical shift left"),
 
-    Opcode(BINARY,  0x10,   "IFB",  2,  "if masked bits set"),
-    Opcode(BINARY,  0x11,   "IFC",  2,  "if masked bits clear"),
-    Opcode(BINARY,  0x12,   "IFE",  2,  "if equal"),
-    Opcode(BINARY,  0x13,   "IFN",  2,  "if not equal"),
-    Opcode(BINARY,  0x14,   "IFG",  2,  "if greater than (unsigned)"),
-    Opcode(BINARY,  0x15,   "IFA",  2,  "if greater than (signed)"),
-    Opcode(BINARY,  0x16,   "IFL",  2,  "if less than (unsigned)"),
-    Opcode(BINARY,  0x17,   "IFU",  2,  "if less than (signed)"),
+    Opcode(BINARY,  0x10,   "IFB",  2,  _COND,  "if masked bits set"),
+    Opcode(BINARY,  0x11,   "IFC",  2,  _COND,  "if masked bits clear"),
+    Opcode(BINARY,  0x12,   "IFE",  2,  _COND,  "if equal"),
+    Opcode(BINARY,  0x13,   "IFN",  2,  _COND,  "if not equal"),
+    Opcode(BINARY,  0x14,   "IFG",  2,  _COND,  "if greater than (unsigned)"),
+    Opcode(BINARY,  0x15,   "IFA",  2,  _COND,  "if greater than (signed)"),
+    Opcode(BINARY,  0x16,   "IFL",  2,  _COND,  "if less than (unsigned)"),
+    Opcode(BINARY,  0x17,   "IFU",  2,  _COND,  "if less than (signed)"),
 
-    Opcode(BINARY,  0x1a,   "ADX",  3,  "add with EX (carry)"),
-    Opcode(BINARY,  0x1b,   "SBX",  3,  "subtract with EX (borrow)"),
+    Opcode(BINARY,  0x1a,   "ADX",  3,  _EX,    "add with EX (carry)"),
+    Opcode(BINARY,  0x1b,   "SBX",  3,  _EX,    "subtract with EX (borrow)"),
 
-    Opcode(BINARY,  0x1e,   "STI",  2,  "set then increment I, J"),
-    Opcode(BINARY,  0x1f,   "STD",  2,  "set then decrement I, J"),
+    Opcode(BINARY,  0x1e,   "STI",  2,  0,      "set then increment I, J"),
+    Opcode(BINARY,  0x1f,   "STD",  2,  0,      "set then decrement I, J"),
 
 
-    Opcode(SPECIAL, 0x01,   "JSR",  3,  "jump and set return"),
+    Opcode(SPECIAL, 0x01,   "JSR",  3,  0,  "jump and set return"),
 
-    Opcode(SPECIAL, 0x08,   "INT",  4,  "trigger software interrupt"),
-    Opcode(SPECIAL, 0x09,   "IAG",  1,  "get interrupt handler address"),
-    Opcode(SPECIAL, 0x0a,   "IAS",  1,  "set interrupt handler address"),
-    Opcode(SPECIAL, 0x0b,   "RFI",  3,  "return from interrupt handler"),
-    Opcode(SPECIAL, 0x0c,   "IAQ",  2,  "enable/disable interrupt queue"),
+    Opcode(SPECIAL, 0x08,   "INT",  4,  0,  "trigger software interrupt"),
+    Opcode(SPECIAL, 0x09,   "IAG",  1,  0,  "get interrupt handler address"),
+    Opcode(SPECIAL, 0x0a,   "IAS",  1,  0,  "set interrupt handler address"),
+    Opcode(SPECIAL, 0x0b,   "RFI",  3,  0,  "return from interrupt handler"),
+    Opcode(SPECIAL, 0x0c,   "IAQ",  2,  0,  "enable/disable interrupt queue"),
 
-    Opcode(SPECIAL, 0x10,   "HWN",  2,  "count hardware devices"),
-    Opcode(SPECIAL, 0x11,   "HWQ",  4,  "get hardware information"),
-    Opcode(SPECIAL, 0x12,   "HWI",  4,  "send hardware interrupt")
+    Opcode(SPECIAL, 0x10,   "HWN",  2,  0,  "count hardware devices"),
+    Opcode(SPECIAL, 0x11,   "HWQ",  4,  0,  "get hardware information"),
+    Opcode(SPECIAL, 0x12,   "HWI",  4,  0,  "send hardware interrupt")
 )
+
+del _EX, _COND
 
 
 #: An instruction set for the DCPU-16 1.7 standard.
