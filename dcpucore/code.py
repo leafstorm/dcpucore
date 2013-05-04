@@ -567,7 +567,7 @@ class SpecialInstruction(Instruction):
 
     @property
     def base_cost(self):
-        return self.opcode.base_cost + self.a.decode_cost
+        return self.opcode.cost + self.a.decode_cost
 
     def assemble(self):
         data = array.array(WORD_ARRAY)

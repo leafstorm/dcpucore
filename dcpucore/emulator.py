@@ -9,6 +9,7 @@ The actual DCPU emulator.
 """
 from __future__ import division
 import array
+from abc import ABCMeta, abstractmethod, abstractproperty
 from collections import deque
 from functools import wraps
 from .code import (DCPU_17, resolve_symbol,
@@ -25,6 +26,50 @@ INT_QUEUE_ENABLED = 0
 INT_QUEUE_EMPTY = 1
 INT_NO_HANDLER = 2
 INT_DELIVERED = 3
+
+
+class HardwareDevice(object):
+    """
+    This is the base class for hardware devices.
+    """
+    __metaclass__ = ABCMeta
+
+    def connect(self, emulator):
+        """
+        Indicates that this device has been connected to an emulator.
+
+        :param emulator: The emulator it was connected to.
+        """
+        self.emulator = emulator
+
+    @abstractproperty
+    def manufacturer_id(self):
+        """
+        A double word identifying the manufacturer of this device.
+        """
+
+    @abstractproperty
+    def hardware_id(self):
+        """
+        A double word identifying this device by the interface it presents
+        to the DCPU.
+        """
+
+    @abstractproperty
+    def hardware_version(self):
+        """
+        A word identifying the current hardware revision.
+        (This can be used for different devices with the same hardware ID
+        and manufacturer ID.)
+        """
+
+    @abstractmethod
+    def interrupt(self):
+        """
+        Signals that a hardware interrupt has been performed against this
+        device. After it is done, it should return however many cycles the
+        interrupt took, on top of the base 4 cycles for hardware interrupts.
+        """
 
 
 class Emulator(object):
@@ -337,6 +382,43 @@ class Emulator(object):
         return value
 
 
+    ### HARDWARE ###
+
+    def connect_hardware(self, hardware):
+        """
+        Connects a hardware device to the DCPU.
+
+        :param hardware: The `HardwareDevice` to connect.
+        """
+        if not isinstance(hardware, HardwareDevice):
+            raise TypeError("Only subclasses of HardwareDevice are allowed")
+        self.hardware.append(hardware)
+        hardware.connect(self)
+
+    def on_invalid_hwn(self, number):
+        """
+        Invoked when HWN is called with a hardware number that is
+        out of range. The default behavior is to zero A, B, C, X, and Y.
+
+        :param number: The hardware number that was introspected.
+        """
+        for reg in (A, B, C, X, Y):
+            self.registers[reg] = 0
+
+    def on_invalid_hwi(self, number):
+        """
+        Invoked when HWI is called with a hardware number that is
+        out of range. The default behavior is to do nothing, besides burn
+        the four cycles.
+
+        This should return the number of cycles the interrupt took. (The
+        default 4 cycles are not included.)
+
+        :param number: The hardware number that was introspected.
+        """
+        return 4
+
+
     ### BINARY INSTRUCTIONS ###
 
     def ex_arithmetic_opcode(backing):
@@ -529,6 +611,14 @@ class Emulator(object):
         self.ia = self.load(a)
         return inst.base_cost
 
+    def RFI(self, inst, a):
+        # Re-enable interrupt queueing
+        self.int_queue_enabled = False
+        # Pop A and PC from the stack
+        self.registers[A] = self.pop()
+        self.pc = self.pop()
+        return inst.base_cost
+
     def IAQ(self, inst, a):
         self.int_queue_enabled = bool(self.load(a))
         return inst.base_cost
@@ -538,8 +628,24 @@ class Emulator(object):
         return inst.base_cost
 
     def HWQ(self, inst, a):
+        hw = self.load(a)
+        if hw < len(self.hardware):
+            device = self.hardware[hw]
+            hwid, mfid = device.hardware_id, device.manufacturer_id
+            self.registers[A] = hwid & WORD_MASK
+            self.registers[B] = (hwid >> 16) & WORD_MASK
+            self.registers[C] = device.hardware_version & WORD_MASK
+            self.registers[X] = mfid & WORD_MASK
+            self.registers[Y] = (mfid >> 16) & WORD_MASK
+        else:
+            self.on_invalid_hwn(hw)
         return inst.base_cost
 
     def HWI(self, inst, a):
         hw = self.load(a)
-        return inst.base_cost
+        if hw < len(self.hardware):
+            device = self.hardware[hw]
+            cycles = device.interrupt()
+            return inst.base_cost + cycles
+        else:
+            return self.on_invalid_hwi(hw)
