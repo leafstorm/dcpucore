@@ -47,6 +47,11 @@ setup(
         'Topic :: System :: Emulators'
     ],
 
+    install_requires=[
+        'ply>=3.4',
+        'docopt>=0.6.1'
+    ],
+
     packages=packages,
     scripts=scripts,
     zip_safe=False
