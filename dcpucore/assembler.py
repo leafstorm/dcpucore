@@ -567,6 +567,10 @@ class AssemblyParser(object):
 
 
     def p_error(self, t):
-        src = SourceReference(self.filenames[-1] if self.filenames else None,
-                              t.lineno)
-        raise AssemblySyntaxError('Misplaced token: %r' % t.value, src)
+        filename = self.filenames[-1] if self.filenames else None
+        if t is None:
+            src = SourceReference(filename, None)
+            raise AssemblySyntaxError('Input ended too soon', src)
+        else:
+            src = SourceReference(filename, t.lineno)
+            raise AssemblySyntaxError('Misplaced token: %r' % t.value, src)
