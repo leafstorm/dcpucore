@@ -309,9 +309,12 @@ class Emulator(object):
             return self.memory[offset & WORD_MASK]
 
         elif address is PUSHPOP:
-            return self.pop(value)
+            return self.pop()
         elif address is PEEK:
             return self.memory[self.sp]
+        elif isinstance(address, Pick):
+            offset = self.sp + address.displacement
+            return self.memory[offset & WORD_MASK]
 
         elif address is SP:
             return self.sp
@@ -349,6 +352,9 @@ class Emulator(object):
             self.push(value)
         elif address is PEEK:
             self.memory[self.sp] = value
+        elif isinstance(address, Pick):
+            offset = self.sp + address.displacement
+            self.memory[offset & WORD_MASK] = value
 
         elif address is SP:
             self.sp = value

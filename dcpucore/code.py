@@ -348,7 +348,7 @@ class InstructionSet(object):
             spec_opcode_number = (lead >> 5) & 0x1f
             opcode = self.opcodes[SPECIAL][spec_opcode_number]
 
-            if a_code >> 10 in long_codes:
+            if lead >> 10 in long_codes:
                 size += 1
         else:
             # Binary instruction
@@ -377,6 +377,8 @@ class InstructionSet(object):
             # Binary instruction
             opcode = self.opcodes[BINARY][opcode_number]
 
+        if opcode is None:
+            return False
         return bool(opcode.flags & Opcode.CONDITIONAL)
 
 
