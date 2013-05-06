@@ -358,7 +358,7 @@ class Emulator(object):
             self.ex = value
 
         elif isinstance(address, Displacement):
-            self.memory[address.displacement] = value
+            self.memory[address.address] = value
         elif isinstance(address, Immediate):
             pass
 
